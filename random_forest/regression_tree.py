@@ -40,7 +40,7 @@ class RegressionTree:
         
         # Ensure `X` and `y` are the right shape
         n, n_features = X.shape
-        self.n, self.n_features = n, n_features
+        self._n, self._n_features = n, n_features
         
         if y.ndim is not 1:
             raise ValueError("`y` must be a 1-dimensional array.")
@@ -103,7 +103,7 @@ class RegressionTree:
         
         how = np.zeros(n_features, dtype=np.uint8)
         
-        self._n, self._n_features = X.shape
+        #self._n, self._n_features = X.shape
         self._params = params
         self._n_nodes, self._flat_tree = build_tree(
             X.copy(), y.copy(), params, how, random_seed)

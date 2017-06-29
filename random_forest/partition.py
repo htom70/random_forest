@@ -2,7 +2,7 @@ import numpy as np
 import numba
 
 from .utils import fisher_yates_shuffle
-from .sort import timsort_
+from .sort import introsort
 
 
 @numba.njit
@@ -96,7 +96,7 @@ def find_minimum_sse_partition(y, MIN_SAMPLES_LEAF, mean_of_y, sse_of_y,
 
 @numba.njit
 def partition_on_feature(X, y, threshold, dim, partition_index):
-    """Reorder rows of X and elements of y to that:
+    """Reorder rows of X and elements of y so that:
         X[:partition_index, dim] <= threshold,  and
         X[partition_index:, dim] > threshold
     """
@@ -109,7 +109,7 @@ def partition_on_feature(X, y, threshold, dim, partition_index):
             while j < n - 1 and X[j, dim] > threshold:
                 j += 1
             y[i], y[j] = y[j], y[i]
-            tmp = X[i].copy()
+            tmp[:] = X[i].copy()
             X[i, :] = X[j, :]
             X[j, :] = tmp
 
@@ -166,7 +166,7 @@ def best_partition(X, y, max_features, min_samples_leaf, dims_permutation, how,
         else:
             x_sort = X[:, dim].copy()
             y_sort = y.copy()
-            timsort_(x_sort, y_sort)
+            introsort(x_sort, y_sort)
         
         index = find_minimum_sse_partition(y_sort, min_samples_leaf,
                                          mean_of_y, sse_of_y,

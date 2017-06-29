@@ -97,6 +97,8 @@ def build_tree(X, y, params, how, random_seed):
     
     best_part_result = np.empty(4, np.float32)
     temp_part_result = np.empty(4, np.float32)
+
+    last_best_dim = -1
     
     for node in range(n * 2):
         
@@ -135,7 +137,9 @@ def build_tree(X, y, params, how, random_seed):
             _dim, split_index = best_partition(
                 X[start:end], y[start:end], MAX_FEATURES, MIN_SAMPLES_LEAF,
                 dims_permutation, how, node_mean, node_impurity,
-                best_part_result, temp_part_result)
+                best_part_result, temp_part_result, last_best_dim)
+            
+            last_best_dim = _dim
             
             # The criterion is middway between the two cut points.
             dim__n_node_samples__left__right[node, 0] = _dim
