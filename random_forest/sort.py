@@ -8,10 +8,16 @@ import numba
 def insertion_sort(x, y, start, end):
     """start and end are inclusive"""
     for i in range(start + 1, end + 1):
-        while i > start and x[i] < x[i - 1]:
-            x[i], x[i - 1] = x[i - 1], x[i]
-            y[i], y[i - 1] = y[i - 1], y[i]
-            i -= 1
+        tmp_x = x[i]
+        tmp_y = y[i]
+        j = i - 1
+        while j >= start and x[j] > tmp_x:
+            x[j + 1] = x[j]
+            y[j + 1] = y[j]
+            j -= 1
+        
+        x[j + 1] = tmp_x
+        y[j + 1] = tmp_y
 
 
 @numba.njit
