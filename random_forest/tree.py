@@ -1,12 +1,11 @@
 import numpy as np
 import numba
-import collections
-
 from .utils import enlarge_first_dimension, mean_and_sse
-from .partition import best_partition
+from .partition import best_partition, PartitionResult
+from .tree_building_stack import *
 
 
-spec = collections.OrderedDict()
+spec = OrderedDict()
 spec["max_depth"] = numba.int32
 spec["min_samples_leaf"] = numba.int32
 spec["max_features"] = numba.int32
@@ -17,37 +16,45 @@ class TreeParams:
         pass
 
 
-# stack columns
-PARENT = np.int32(0)
-START = np.int32(1)
-END = np.int32(2)
+# Flattening tree structure containing the decisions.
+FLAT_TREE_COLUMNS = 8
 
-n_integral_stack_columns = END + 1
+@numba.njit
+def gen_flat_tree(size):
+    raw_tree = np.empty((size, FLAT_TREE_COLUMNS), dtype=np.int32)
+    return raw_tree
 
-# stack_f columns
-NODE_MEAN = np.int32(0)
-NODE_IMPURITY = np.int32(1)
-RIGHT_CHILD_MEAN = np.int32(2)
-RIGHT_CHILD_IMPURITY = np.int32(3)
 
-# n_stack_columns = RIGHT_CHILD_IMPURITY + 1
-n_stack_columns = END + 2 + RIGHT_CHILD_IMPURITY
+@numba.njit
+def flat_tree_fields(flat_tree):
+    """(DIM, N, LEFT, RIGHT, DECISION, MEAN, IMPURITY)"""
+    return (flat_tree[:, 0],
+            flat_tree[:, 1],
+            flat_tree[:, 2],
+            flat_tree[:, 3],
+            flat_tree[:, 5].view(np.float32),
+            flat_tree[:, 6].view(np.float32),
+            flat_tree[:, 7].view(np.float32))
+
+
+@numba.njit
+def grow_flat_tree(raw_tree):
+    """FLAT_TREE, (DIM, N, LEFT, RIGHT, PARENT, DECISION, MEAN, IMPURITY)"""
+    size = raw_tree.shape[0] * 2
+    bigger = np.empty((size, FLAT_TREE_COLUMNS), dtype=np.int32)
+    bigger[:raw_tree.shape[0]] = raw_tree
+    return bigger
+    # return bigger, flat_tree_fields(raw_tree)
 
 
 @numba.njit
 def build_tree(X, y, params, how, random_seed):
-    """Build a regression tree without recursion.
-    
-    The tree is stored in a flattened 2d array."""
-    
-    # The shape of the data to
     n, n_features = X.shape
     
     MAX_DEPTH = params.max_depth
     if MAX_DEPTH <= 0:
         MAX_DEPTH = n * 2
     MAX_DEPTH = min(n * 2, MAX_DEPTH)
-    
     MAX_FEATURES = params.max_features
     MIN_SAMPLES_SPLIT = params.min_samples_split
     MIN_SAMPLES_LEAF = params.min_samples_leaf
@@ -58,200 +65,159 @@ def build_tree(X, y, params, how, random_seed):
     
     np.random.seed(random_seed)
     
-    parent_end = n
+    node_mean, node_impurity = mean_and_sse(y)
     
-    est_samples_per_leaf = max(MIN_SAMPLES_LEAF, MIN_SAMPLES_SPLIT // 2)
+    stack = Stack()
+    stack.start = 0
+    stack.end = n
+    stack.index = 0
+    stack.node_mean = node_mean
+    stack.node_impurity = node_impurity
     
-    # Stack is an array that is treated like a FIFO data-structure
-    if params.max_depth > 0:
-        stack_size = params.max_depth + 1
-    else:
-        stack_size = np.int32(
-            np.ceil(np.log2(np.ceil(n // est_samples_per_leaf) * 2)))
+    flat_tree = gen_flat_tree(1024)
+    (DIM, N_SAMPLES, LEFT, RIGHT, DECISION, NODE_MEAN,
+     NODE_IMPURITY) = flat_tree_fields(flat_tree)
     
-    stack_i = np.empty((stack_size, n_stack_columns), dtype=np.int32)
-    stack_f = stack_i[:, n_integral_stack_columns:].view(np.float32)
-    stack_f[:] = np.nan
-    stack_index = np.int32(0)  # Stack must starts with one element
+    DECISION[:] = np.nan
+    NODE_MEAN[:] = np.nan
+    NODE_IMPURITY[:] = np.nan
     
-    stack_i[stack_index, PARENT] = -1
-    stack_i[stack_index, START] = 0
-    stack_i[stack_index, END] = n
-    tmp = mean_and_sse(y)
-    stack_f[stack_index, NODE_MEAN] = tmp[0]
-    stack_f[stack_index, NODE_IMPURITY] = tmp[1]
-    stack_f[stack_index, RIGHT_CHILD_MEAN] = np.nan
-    stack_f[stack_index, RIGHT_CHILD_IMPURITY] = np.nan
+    DIM[:] = -1
+    N_SAMPLES[:] = -1
+    LEFT[:] = -1
+    RIGHT[:] = -1
     
-    # The current tree node
-    node = np.int32(0)
+    temp_a = PartitionResult()
+    temp_b = PartitionResult()
     
-    # Raw backing memory for contiguous access
-    raw_array_size = 1024
-    raw_array = np.empty((raw_array_size, 6), np.int32)
-    dim__n_node_samples__left__right = raw_array[:, 0:4]
-    decision_est__impurity = raw_array[:, 4:].view(np.float32)
-    decision_est__impurity[0, 1] = tmp[1]
-    
-    contrib_data = np.uint32(0)
-    
-    best_part_result = np.empty(4, np.float32)
-    temp_part_result = np.empty(4, np.float32)
-
     last_best_dim = -1
     
-    for node in range(n * 2):
+    node = -1
+    
+    while True:
         
-        # Resize the output array if it is too large to
-        if node >= raw_array_size:
-            raw_array_size = min(raw_array_size * 2, n * 2)
-            raw_array = enlarge_first_dimension(raw_array, raw_array_size)
-            dim__n_node_samples__left__right = raw_array[:, 0:4]
-            decision_est__impurity = raw_array[:, 4:].view(np.float32)
+        node += 1
+        # print('NODE', node, '-----------------------------------------')
+        # print_stack(stack)
         
-        # Each iteration deals with the portion X[start:end, :], y[start:end]
-        # Either splitting it up further or setting it to a terminal leaf
-        start = stack_i[stack_index, START]
-        end = stack_i[stack_index, END]
+        stack.index = node
+        
+        if node >= DIM.size:
+            flat_tree = grow_flat_tree(flat_tree)
+            (DIM, N_SAMPLES, LEFT, RIGHT, DECISION,
+             NODE_MEAN, NODE_IMPURITY) = flat_tree_fields(flat_tree)
+        
+        start, end = stack.start, stack.end
         m = end - start
         
-        # These values are computed and set by the parent before this node reached
-        node_mean = stack_f[stack_index, NODE_MEAN]  # Mean of y[start:end]
-        node_impurity = stack_f[
-            stack_index, NODE_IMPURITY]  # Impurity of y[start:end]
+        # print('node mean', stack.node_mean, np.mean(y[start:end]))
+        # print('node impurity', stack.node_impurity, sse(y[start:end]))
+        # assert_close(stack.node_mean, np.mean(y[start:end]), 1e-2)
+        # assert_close(stack.node_impurity, sse(y[start:end]), 1e-2)
         
-        # This is a leaf node: add nothing to the stack
-        if (m < MIN_SAMPLES_LEAF * 2
-            or m < MIN_SAMPLES_SPLIT
-            or stack_index >= MAX_DEPTH):
-            dim__n_node_samples__left__right[node, 0] = -1
-            dim__n_node_samples__left__right[node, 1] = m
-            dim__n_node_samples__left__right[node, 2] = -1
-            dim__n_node_samples__left__right[node, 3] = -1
-            decision_est__impurity[node, 0] = node_mean
-            decision_est__impurity[node, 1] = node_impurity
-            contrib_data += m
+        N_SAMPLES[node] = m
+        node_mean = stack.node_mean
+        NODE_MEAN[node] = node_mean
+        node_impurity = stack.node_impurity
+        NODE_IMPURITY[node] = node_impurity
         
-        # This is not a terminal node, we partition it
+        # If the node is a leaf node then write then write to permanent
+        # flat_tree and unwind
+        if (m <= MIN_SAMPLES_LEAF * 2
+            or m <= MIN_SAMPLES_SPLIT
+            or stack.depth > MAX_DEPTH):
+            
+            N_SAMPLES[node] = m
+            DIM[node] = -2
+            LEFT[node] = -1
+            RIGHT[node] = -1
+            DECISION[node] = np.nan
+            
+            # Unwind the stack until we have found a left node
+            # This sets the RIGHT_CHILD_{MEAN, IMPURITY} fields
+            # in the flat tree, something we have not yet done.
+            stack = unwind_stack(stack, RIGHT)
+            
+            if is_root(stack):
+                break  # If this is the root node we're done
+            else:
+                # Otherwise we switch to the right counterpart of the
+                # left node we've unwound to.
+                assert is_left_child(stack)
+                replace_left_node_with_right(stack)
+                
+                # print_stack(stack)
+        
         else:
-            _dim, split_index = best_partition(
-                X[start:end], y[start:end], MAX_FEATURES, MIN_SAMPLES_LEAF,
-                dims_permutation, how, node_mean, node_impurity,
-                best_part_result, temp_part_result, last_best_dim)
+            # Partition X[start:end], y[start:end] based on the
+            # best predictor.
+            best = best_partition(X[start:end], y[start:end],
+                                  MAX_FEATURES, MIN_SAMPLES_LEAF,
+                                  dims_permutation, how,
+                                  node_mean, node_impurity, temp_a, temp_b)
             
-            last_best_dim = _dim
+            last_best_dim = best.dim
+            # assert best.index >= MIN_SAMPLES_LEAF
             
-            # The criterion is middway between the two cut points.
-            dim__n_node_samples__left__right[node, 0] = _dim
-            dim__n_node_samples__left__right[node, 1] = m
-            dim__n_node_samples__left__right[node, 2] = node + 1
-            # dim__n_node_samples__left__right[node, 3] = -1
-            decision_est__impurity[node, 0] = X[start + split_index, _dim]
-            decision_est__impurity[node, 1] = node_impurity
+            # Set RIGHT_CHILD_MEAN and RIGHT_CHILD_IMPURITY for current node
+            stack.right_child_mean = best.right_mean
+            stack.right_child_impurity = best.right_sse
             
-            stack_f[stack_index, RIGHT_CHILD_MEAN] = best_part_result[2]
-            stack_f[stack_index, RIGHT_CHILD_IMPURITY] = best_part_result[3]
+            # Flat tree elements
+            DIM[node] = best.dim
+            DECISION[node] = best.split_value
+            LEFT[node] = node + 1
             
-            stack_index += 1
-            # Now we're referring to the child.
-            
-            if stack_index >= stack_i.shape[0]:
-                stack_i = enlarge_first_dimension(stack_i,
-                                                  stack_i.shape[0] * 2)
-                stack_f = stack_i[:, n_integral_stack_columns:].view(
-                    np.float32)
-            
-            # Set the parent node of the child to the current node
-            stack_i[stack_index, PARENT] = node
-            stack_i[stack_index, START] = start
-            stack_i[stack_index, END] = start + split_index
-            stack_f[stack_index, NODE_MEAN] = best_part_result[
-                0]  # .left_mean
-            stack_f[stack_index, NODE_IMPURITY] = best_part_result[
-                1]  # .left_sse
-            continue
-        
-        # 'Unwind' the stack until either:
-        #  (1) We have no more stack elements
-        #  (2) We can add a right node to one of the elements:
-        #      in this case `end` is not equal to `parent_end`.
-        current_node = node
-        parent_node = stack_i[stack_index, PARENT]
-        parent_end = stack_i[stack_index - 1, END]
-        while stack_index > 0 and end == parent_end:
-            dim__n_node_samples__left__right[parent_node, 3] = current_node
-            stack_index -= 1
-            current_node = parent_node
-            end = parent_end
-            parent_node = stack_i[stack_index, PARENT]
-            parent_end = stack_i[stack_index - 1, END]
-        
-        # Now, either we're finished building the tree...
-        if stack_index <= 0:
-            break
-        
-        # Or we add the right counterpart of the left node we've unwound to
-        if stack_index >= 1:  # and end != stack[stack_index - 1,]:
-            # Parent of a right node is the same as the left node
-            #     stack_i[stack_index, PARENT] = <same>  <- Not needed
-            stack_i[stack_index, START] = end
-            stack_i[stack_index, END] = parent_end  # The parent's slice end
-            stack_f[stack_index, NODE_MEAN] = stack_f[
-                stack_index - 1, RIGHT_CHILD_MEAN]
-            stack_f[stack_index, NODE_IMPURITY] = stack_f[
-                stack_index - 1, RIGHT_CHILD_IMPURITY]
-            #stack_f[stack_index, PARENT_SPLIT_FEATURE]
+            # Now add the info for the next node
+            stack = push(stack)
+            stack.start = start
+            stack.end = start + best.index
+            stack.node_mean = best.left_mean
+            stack.node_impurity = best.left_sse
+            if best.left_is_sorted:
+                stack.sorted_dim = best.dim
+            # stack.index = node + 1
     
-    assert contrib_data == n  # We should have touched all of the `y` data once
-    return node + 1, raw_array[:node + 1].copy()
+    return flat_tree[:node + 1]
 
 
 @numba.njit
 def _predict(flat_tree, X_pred):
-    """Predict values from a regression tree."""
+    (DIMENSION, N_SAMPLES, LEFT, RIGHT, DECISION,
+     NODE_MEAN, NODE_IMPURITY) = flat_tree_fields(flat_tree)
+    
     n, n_features = X_pred.shape
-    # dims = flat_tree[:, 0]
-    threshold_or_est = flat_tree[:, 4].view(numba.float32)
-    
-    # dim__n_node_samples__left__right = raw_array[:, 0:4]
-    # decision_est__impurity = raw_array[:, 4:].view(np.float32)
-    
-    y_pred = np.empty(n, np.float32)
-    
-    dim = np.int32(0)
-    node = np.int32(0)
+    y_pred = np.empty(n, dtype=np.float32)
     
     for i in range(n):
         node = 0
-        dim = flat_tree[node, 0]
+        dim = DIMENSION[0]
         while dim >= 0:
-            if X_pred[i, dim] < threshold_or_est[node]:
-                node = flat_tree[node, 2]
+            if X_pred[numba.int32(i), dim] <= DECISION[node]:
+                node = LEFT[node]
             else:
-                node = flat_tree[node, 3]
-            dim = flat_tree[node, 0]
-        
-        y_pred[i] = threshold_or_est[node]
-    
+                node = RIGHT[node]
+            dim = DIMENSION[node]
+        y_pred[i] = NODE_MEAN[node]
     return y_pred
 
 
-@numba.njit
-def _feature_importances(flat_tree, n_features):
-    """Calculate the proxy feature importance as the average decrease in impurity."""
-    n = flat_tree.shape[0]
-    dim_or_size = flat_tree[:, 0]
-    # n_node_samples = flat_tree[:, 1]
-    left = flat_tree[:, 2]
-    right = flat_tree[:, 3]
-    #crit_or_est = flat_tree[:, 4].view(np.float32)
-    impurity = flat_tree[:, 5]
-    
-    sum_impurity = np.zeros(n_features)
-    for node in range(n):
-        if left[node] > 0:  # Node is not a leaf
-            impurity[node]
-            diff = impurity[node] - impurity[left[node]] - impurity[
-                right[node]]
-            sum_impurity[dim_or_size[node]] += diff
-    return sum_impurity / sum_impurity.max()
+# @numba.njit
+# def _feature_importances(flat_tree, n_features):
+#     """Calculate the proxy feature importance as the average decrease in impurity."""
+#     n = flat_tree.shape[0]
+#     dim_or_size = flat_tree[:, 0]
+#     # n_node_samples = flat_tree[:, 1]
+#     left = flat_tree[:, 2]
+#     right = flat_tree[:, 3]
+#     # crit_or_est = flat_tree[:, 4].view(np.float32)
+#     impurity = flat_tree[:, 5]
+#
+#     sum_impurity = np.zeros(n_features)
+#     for node in range(n):
+#         if left[node] > 0:  # Node is not a leaf
+#             impurity[node]
+#             diff = impurity[node] - impurity[left[node]] - impurity[
+#                 right[node]]
+#             sum_impurity[dim_or_size[node]] += diff
+#     return sum_impurity / sum_impurity.max()

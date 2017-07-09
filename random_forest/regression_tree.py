@@ -10,9 +10,10 @@ class RegressionTree:
                  max_features=None,
                  min_samples_split=None,
                  min_samples_leaf=None,
-                 random_seed=None):
+                 random_seed=None,
+                 _copy_inputs=True):
         """Fit a regression tree to continuous data.
-
+        
         Arguments
         ---------
         X : (n, m) array
@@ -37,6 +38,11 @@ class RegressionTree:
 
         The arguments `min_impurity_split` and `presort` are also not supported.
         """
+        X = np.asarray(X)
+        if X.ndim < 2:
+            X = np.atleast_2d(X).reshape((X.size, 1))
+        
+        y = np.asarray(y)
         
         # Ensure `X` and `y` are the right shape
         n, n_features = X.shape
@@ -90,23 +96,20 @@ class RegressionTree:
                     "`max_features` must be <= n_features (X.shape[1]).")
         params.max_features = max_features
         
-        # print('md', params.max_depth)
-        # print('msl', params.min_samples_leaf)
-        # print('mss', params.min_samples_split)
-        # print('max_features', max_features)
-        # print('n, n_features', X.shape, y.shape)
-        
-        # random_seed
         if random_seed is None:
             random_seed = np.random.randint(np.iinfo(np.int32).max)
-        # print('random_seed', random_seed)
         
         how = np.zeros(n_features, dtype=np.uint8)
         
-        #self._n, self._n_features = X.shape
         self._params = params
-        self._n_nodes, self._flat_tree = build_tree(
+        
+        if _copy_inputs:
+            X = X.copy()
+            y = y.copy()
+        
+        self._flat_tree = build_tree(
             X.copy(), y.copy(), params, how, random_seed)
+        
         self._flat_tree.flags.writeable = False
 
     @property
@@ -128,7 +131,7 @@ class RegressionTree:
     @property
     def max_features(self):
         return self._params.max_features
-
+    
     @property
     def min_samples_split(self):
         return self._params.min_samples_split
@@ -141,9 +144,11 @@ class RegressionTree:
     def flat_tree(self):
         return self._flat_tree
     
-    def predict(self, X):
+    def predict(self, X_pred):
         """Predict the values of y at a given X values."""
-        return _predict(self._flat_tree, X)
+        if X_pred.shape[1] != self.n_features:
+            raise ValueError("X_pred")
+        return _predict(self._flat_tree, X_pred)
     
     def feature_importances(self):
         """Calculate proxy variable importance fo"""
